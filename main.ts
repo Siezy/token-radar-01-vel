@@ -1,3 +1,5 @@
+// token-radar-01 entry: radar-2 model, category-benchmark implied value
+//
 // A working token-radar-01 entry (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
