@@ -1,6 +1,9 @@
 {
- "as_of": "2026-11-26",
+ "as_of": "2026-11-27T10:18:55Z",
  "source": "DefiLlama fees API, annualized over trailing 1y",
+ "generator": {
+  "agent-authored": true
+ },
  "protocols": {
   "wbtc": {
    "id": "2",

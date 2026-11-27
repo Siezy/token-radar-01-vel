@@ -1,15 +1,27 @@
 <!doctype html>
+<!--
+  Launch Radar (radar-4) — shell halaman.
+
+  Struktur:
+  - <meta viewport> biar responsive di mobile.
+  - app.css : seluruh styling (CSS variables + theme).
+  - #board  : container utama; app.js merender seluruh UI ke dalam elemen ini.
+  - data.js : dataset snapshot (protokol, fee annualized, benchmark) — diload duluan.
+  - app.js  : logic rendering (table, sort, drawer, factor bars) — diload terakhir.
+-->
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Launch Radar — pre-token protocols ranked by implied value</title>
-<link rel="stylesheet" href="app.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Launch Radar — radar-4</title>
+  <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
-<script src="../data.js"></script>
-<script src="app.js"></script>
+  <a class="skip" href="#board">Skip to the board</a>
+  <div id="app">
+    <main id="board" tabindex="-1" aria-busy="true"></main>
+  </div>
+  <script src="../data.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
