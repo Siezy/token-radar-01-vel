@@ -1,4 +1,14 @@
-// v2: category-benchmark implied value — median mcap/tvl per category, global median fallback.
+// v3 (radar-3): category-benchmark implied value + breadth premium + clamped multiples.
+//
+// v3 changes over v2:
+//   breadth    = 1 + BREADTH_PCT_PER_CHAIN x min(chains.length - 1, BREADTH_CHAIN_CAP)
+//                (a multi-chain premium: +0.02 per extra chain, capped at 10 extra chains = +0.20)
+//   multiple   = clamp(raw_category_multiple, MULTIPLE_FLOOR, MULTIPLE_CAP)  (floor 0.05, cap 1.0)
+//                so no outlier category dominates the board; benchmarks carry `clamped` and
+//                `multiple_raw` so the dashboard can show when a multiple was clamped
+//   implied    = max(1, round(tvl_usd x multiple x maturity x momentum x breadth))
+//
+// v2 (kept): category-benchmark implied value — median mcap/tvl per category, global median fallback.
 //
 // The token radar's model: one snapshot of the protocol universe in, one ranked board out.
 //
@@ -47,6 +57,10 @@ export interface Snapshot {
 export interface CategoryBenchmark {
   multiple: number;
   n: number;
+  // v3: whether the raw median was clamped into [MULTIPLE_FLOOR, MULTIPLE_CAP].
+  clamped: boolean;
+  // v3: the raw median before clamping, so the dashboard can show both.
+  multiple_raw: number;
 }
 
 /** The benchmark table: every qualifying category plus the global fallback under `global`. */
@@ -68,6 +82,12 @@ export interface ModelConstants {
   momentum_floor: number;
   momentum_cap: number;
   momentum_scale: number;
+  // v3: breadth premium per extra chain, and the cap on counted extra chains.
+  breadth_pct_per_chain: number;
+  breadth_chain_cap: number;
+  // v3: the clamp band for category multiples.
+  multiple_floor: number;
+  multiple_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -84,10 +104,14 @@ export const MODEL: ModelConstants = {
   momentum_floor: 0.7,
   momentum_cap: 1.3,
   momentum_scale: 200,
+  breadth_pct_per_chain: 0.02,
+  breadth_chain_cap: 10,
+  multiple_floor: 0.05,
+  multiple_cap: 1.0,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -127,6 +151,8 @@ export interface BoardRow {
     maturity_multiplier: number;
     momentum_multiplier: number;
     age_days: number | null;
+    breadth_multiplier: number;
+    chain_count: number;
   };
   farm_steps: string[];
 }
@@ -148,6 +174,8 @@ export interface RadarRow {
   maturity_multiplier: number;
   momentum_multiplier: number;
   category_multiple: number;
+  breadth_multiplier: number;
+  chain_count: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -175,6 +203,9 @@ export interface RadarData {
   rows: RadarRow[];
   live: LiveRow[];
   category_benchmark: BenchmarkTable;
+  // v3: the board's aggregate implied value: the sum and the median over every row.
+  total_implied_usd: number;
+  median_implied_usd: number;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -209,9 +240,16 @@ function median(values: number[]): number | null {
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
 }
 
+/** A category multiple clamped into [MULTIPLE_FLOOR, MULTIPLE_CAP] so no outlier dominates the board. */
+function clampMultiple(raw: number, model: ModelConstants): CategoryBenchmark {
+  const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw));
+  return { multiple, n: 0, clamped: multiple !== raw, multiple_raw: raw };
+}
+
 /**
  * The benchmark table: for every category with at least `model.category_min_samples` tokened protocols,
- * the median mcap/tvl of those samples; plus the global median over all tokened protocols under `global`.
+ * the median mcap/tvl of those samples (v3: clamped into the multiple band); plus the global median over
+ * all tokened protocols under `global`.
  */
 export function categoryBenchmarks(snapshot: Snapshot, model: ModelConstants = MODEL): BenchmarkTable {
   const ratios = snapshot.protocols
@@ -219,7 +257,8 @@ export function categoryBenchmarks(snapshot: Snapshot, model: ModelConstants = M
     .map((p) => ({ category: p.category, ratio: p.mcap_usd! / p.tvl_usd }));
   const table: BenchmarkTable = {};
   const global = median(ratios.map((r) => r.ratio));
-  table['global'] = { multiple: global ?? model.base_multiple, n: ratios.length };
+  const globalBench = clampMultiple(global ?? model.base_multiple, model);
+  table['global'] = { ...globalBench, n: ratios.length };
   const byCategory = new Map<string, number[]>();
   for (const r of ratios) {
     if (r.category === null) continue;
@@ -229,7 +268,7 @@ export function categoryBenchmarks(snapshot: Snapshot, model: ModelConstants = M
   }
   for (const [category, list] of byCategory) {
     if (list.length < model.category_min_samples) continue;
-    table[category] = { multiple: median(list)!, n: list.length };
+    table[category] = { ...clampMultiple(median(list)!, model), n: list.length };
   }
   return table;
 }
@@ -240,7 +279,7 @@ export function impliedValue(
   asOf: string,
   model: ModelConstants,
   benchmarks?: BenchmarkTable,
-): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null; categoryMult: number; benchmarkN: number } {
+): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null; categoryMult: number; benchmarkN: number; breadthMult: number; chainCount: number } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -256,9 +295,12 @@ export function impliedValue(
   const table = benchmarks ?? { global: { multiple: model.base_multiple, n: 0 } };
   const bench = (protocol.category !== null && table[protocol.category]) || table['global'];
   const categoryMult = bench.multiple;
+  // v3 breadth premium: +breadth_pct_per_chain per extra chain beyond the first, capped.
+  const chainCount = protocol.chains.length;
+  const breadthMult = 1 + model.breadth_pct_per_chain * Math.min(Math.max(0, chainCount - 1), model.breadth_chain_cap);
   const base = protocol.tvl_usd * categoryMult;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age, categoryMult, benchmarkN: bench.n };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
+  return { implied, growthPct, growthMult, maturityMult, age, categoryMult, benchmarkN: bench.n, breadthMult, chainCount };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -335,6 +377,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
       maturity_multiplier: round4(s.maturityMult),
       momentum_multiplier: round4(s.growthMult),
       age_days: s.age,
+      breadth_multiplier: round4(s.breadthMult),
+      chain_count: s.chainCount,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -388,16 +432,43 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** The realistic gas cost on one chain, in the words a farmer can budget from. */
+function gasFor(chain: string): string {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return '$5 to $15 gas per transaction';
+  if (['base', 'arbitrum', 'optimism', 'polygon', 'blast', 'scroll', 'linea', 'zksync', 'mantle', 'mode'].some((l2) => c.includes(l2))) {
+    return 'under $1 gas per transaction';
+  }
+  if (['solana', 'sui', 'aptos', 'near'].some((fast) => c.includes(fast))) return 'under $0.10 gas per transaction';
+  return 'a few dollars of gas per transaction';
+}
+
+/** The weekly action the category asks for, in the words a farmer can follow. */
+function weeklyActionFor(p: SnapshotProtocol, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Make one qualifying action each week: borrow a small amount against the supply and repay it on ${name} (${chain}).`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Make one qualifying action each week: run one small swap through ${name}'s pool on ${chain}.`;
+  if (c.includes('bridge')) return `Make one qualifying action each week: bridge a small amount of USDC through ${name} to ${chain} and back.`;
+  if (c.includes('staking') || c.includes('restak')) return `Make one qualifying action each week: claim the staking reward from ${name} and restake it.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Make one qualifying action each week: open and close one small position on ${name}.`;
+  if (c.includes('prediction')) return `Make one qualifying action each week: place one small market position on ${name}.`;
+  return `Make one qualifying action each week: deposit, swap, borrow or vote once through ${name} on ${chain}.`;
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
- * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * A protocol's farm plan: the setup, the main action, a second-chain action when the protocol spans
+ * more than one chain, the weekly action, the hold, the claim and the log — each with a cost and a
+ * time. The plan is derived from the protocol's own record (category, chains, TVL, age), never from a
+ * hand-written list of names.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
+  const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
-  return [
+  const steps: FarmStep[] = [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
@@ -408,9 +479,18 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
       time: '15 minutes to set up',
     },
+  ];
+  if (secondChain !== null) {
+    steps.push({
+      text: `Repeat one action on ${p.name}: bridge or supply $${Math.round(capital / 2)} on ${secondChain} so the activity reaches that chain too.`,
+      cost: `bridge fee plus ${gasFor(secondChain)}`,
+      time: '20 minutes',
+    });
+  }
+  steps.push(
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
-      cost: 'about $2 of gas a week',
+      text: weeklyActionFor(p, chain),
+      cost: `about $2 of gas a week (${gasFor(chain)})`,
       time: '10 minutes a week',
     },
     {
@@ -428,7 +508,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'nothing but the log',
       time: '5 minutes',
     },
-  ];
+  );
+  return steps;
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -466,6 +547,8 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     momentum_multiplier: row.model.momentum_multiplier,
     category_multiple: row.model.category_multiple,
+    breadth_multiplier: row.model.breadth_multiplier,
+    chain_count: row.model.chain_count,
   };
 }
 
@@ -475,6 +558,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model, bench);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const implieds = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
+  const mid = implieds.length >> 1;
+  const medianImplied = implieds.length === 0 ? 0 : implieds.length % 2 === 1 ? implieds[mid]! : (implieds[mid - 1]! + implieds[mid]!) / 2;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -488,6 +574,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     rows: board.map(radarRow),
     live,
     category_benchmark: bench,
+    total_implied_usd: implieds.reduce((a, b) => a + b, 0),
+    median_implied_usd: medianImplied,
   };
   return { board, radar };
 }

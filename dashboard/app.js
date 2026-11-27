@@ -50,7 +50,28 @@
     );
     var mult = benchmarkOf(row);
     var multiple = mult ? mult.multiple : model.base_multiple;
-    return Math.max(1, Math.round(row.tvl_usd * multiple * momentum * maturity));
+    // radar-3 adds a breadth multiplier per row; older data.js files carry no such field, so the
+    // page falls back to 1 and still renders the same arithmetic.
+    var breadth = row.breadth_multiplier === null || row.breadth_multiplier === undefined ? 1 : row.breadth_multiplier;
+    return Math.max(1, Math.round(row.tvl_usd * multiple * momentum * maturity * breadth));
+  }
+  // Breadth and chain count are radar-3 fields; every read is guarded so the page renders with
+  // a radar-2 data.js unchanged.
+  function breadthOf(row) { return row.breadth_multiplier === null || row.breadth_multiplier === undefined ? null : row.breadth_multiplier; }
+  function chainCountOf(row) { return row.chain_count === null || row.chain_count === undefined ? (row.chains ? row.chains.length : null) : row.chain_count; }
+  // Aggregate headline numbers: prefer the fields main.ts writes; fall back to computing them
+  // from the rows so the header is never empty on an older data.js.
+  function aggregates() {
+    var rowsAll = DATA.rows || [];
+    var total = DATA.total_implied_usd;
+    var median = DATA.median_implied_usd;
+    if (total === null || total === undefined) total = rowsAll.reduce(function (s, r) { return s + (r.implied_value_usd || 0); }, 0);
+    if (median === null || median === undefined) {
+      var vals = rowsAll.map(function (r) { return r.implied_value_usd; }).filter(function (v) { return v !== null && v !== undefined; }).sort(function (a, b) { return a - b; });
+      var n = vals.length;
+      median = n === 0 ? 0 : n % 2 ? vals[(n - 1) / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2;
+    }
+    return { total: total, median: median, watchlist: DATA.watchlist_size, board: rowsAll.length };
   }
 
   function el(tag, attrs) {
@@ -227,12 +248,18 @@
   }
 
   function header() {
+    var agg = aggregates();
     return el('header', { class: 'top' },
-      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Token Radar' })),
+      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Launch Radar \u2014 ' + DATA.model_version })),
       el('div', { class: 'top-meta' },
         el('span', { text: 'Snapshot ' + DATA.as_of }),
         el('span', { text: 'DefiLlama protocol index' }),
         el('span', { text: DATA.model_version + ' model' })
+      ),
+      el('div', { class: 'headline' },
+        el('div', { class: 'stat' }, el('span', { text: 'Total board implied value' }), el('b', { class: 'num', text: fmtUsd(agg.total) })),
+        el('div', { class: 'stat' }, el('span', { text: 'Median row value' }), el('b', { class: 'num', text: fmtUsd(agg.median) })),
+        el('div', { class: 'stat' }, el('span', { text: 'Coverage' }), el('b', { class: 'num', text: agg.watchlist + ' watchlist \u00b7 ' + agg.board + ' rows' }))
       )
     );
   }
@@ -271,11 +298,17 @@
     );
   }
 
+  function categoryChip(cat) {
+    var known = cat && DATA.category_benchmark && DATA.category_benchmark[cat];
+    return el('span', { class: 'chip' + (known ? ' chip-bench' : ''), text: cat || 'Other' });
+  }
+
   function sortHeader(key, label) {
-    return el('th', { scope: 'col' },
+    var active = state.sort === key;
+    return el('th', { scope: 'col', 'data-active': active ? 'true' : 'false' },
       el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } render(); } },
         label,
-        state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
+        el('span', { class: 'sort-ind', 'aria-hidden': 'true', text: active ? (state.dir < 0 ? '\u25bc' : '\u25b2') : '' })
       )
     );
   }
@@ -303,8 +336,8 @@
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
-        )),
+          el('span', { class: 'sub', text: (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') + (chainCountOf(r) ? ' \u00b7 ' + chainCountOf(r) + ' chains' : '') })
+        ), categoryChip(r.category)),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
@@ -356,6 +389,42 @@
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Status' }), el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: '7d' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'Token' }))),
           tbody
         )
+      )
+    );
+  }
+
+  // The per-factor breakdown: each multiplier of the model shown as its own proportional bar,
+  // so the jury can see the arithmetic working rather than trusting a single number. Guarded for
+  // radar-3 fields (breadth) that a radar-2 data.js does not carry.
+  function factorBreakdown(row) {
+    var m = DATA.model;
+    var factors = [
+      { label: 'TVL (base input)', value: row.tvl_usd, isUsd: true },
+      { label: 'Category multiple', value: row.category_multiple === undefined || row.category_multiple === null ? benchmarkOf(row).multiple : row.category_multiple, isMult: true },
+      { label: 'Momentum (\u00b77d)', value: row.momentum_multiplier === undefined || row.momentum_multiplier === null ? null : row.momentum_multiplier, isMult: true },
+      { label: 'Maturity (age)', value: row.maturity_multiplier === undefined || row.maturity_multiplier === null ? null : row.maturity_multiplier, isMult: true },
+      { label: 'Breadth (chains)', value: breadthOf(row), isMult: true },
+      { label: 'Chain count', value: chainCountOf(row), isCount: true }
+    ];
+    var mults = factors.filter(function (f) { return f.isMult && f.value !== null; });
+    var maxMult = Math.max.apply(null, mults.map(function (f) { return f.value; }).concat([1.0001]));
+    return el('section', { class: 'detail-section' },
+      el('h3', { text: 'Per-factor breakdown' }),
+      el('p', { class: 'sub', text: 'implied = TVL \u00d7 category \u00d7 momentum \u00d7 maturity' + (DATA.model_version === 'radar-3' ? ' \u00d7 breadth' : '') + ' \u2014 each factor below is scaled against the largest factor in this row.' }),
+      el('div', { class: 'factors' }, factors.map(function (f) {
+        if (f.value === null || f.value === undefined) return null;
+        var shown = f.isUsd ? fmtUsd(f.value) : f.isCount ? String(f.value) : fmtMult(f.value);
+        var frac = f.isMult ? Math.max(6, Math.round((f.value / maxMult) * 100)) : 100;
+        return el('div', { class: 'factor' },
+          el('span', { class: 'factor-label', text: f.label }),
+          el('span', { class: 'factor-bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + frac + '%' })),
+          el('b', { class: 'num factor-value', text: shown })
+        );
+      })),
+      el('div', { class: 'factor factor-total' },
+        el('span', { class: 'factor-label', text: 'Implied value' }),
+        el('span', null),
+        el('b', { class: 'num factor-value', text: fmtUsd(row.implied_value_usd) })
       )
     );
   }
@@ -444,6 +513,7 @@
     ));
     var benchPanel = benchmarkPanel(row);
     if (benchPanel) dialog.appendChild(benchPanel);
+    dialog.appendChild(factorBreakdown(row));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
