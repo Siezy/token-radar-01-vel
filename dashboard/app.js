@@ -267,7 +267,7 @@
   function lede() {
     return el('section', { class: 'lede' },
       el('div', null,
-        el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
+        el('h1', { text: 'Launch Radar \u2014 ' + DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
         el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols below that floor. Implied value is a model, not a promise.' })
       ),
       el('div', { class: 'facts' },
@@ -530,6 +530,12 @@
     }
   }
 
+  function footer() {
+    return el('footer', { class: 'foot' },
+      el('span', { text: 'Launch Radar \u00b7 model ' + DATA.model_version + ' \u00b7 snapshot as of ' + DATA.as_of + ' \u00b7 source: ' + DATA.source + ' \u00b7 all numbers are model estimates, not prices.' })
+    );
+  }
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
@@ -538,6 +544,7 @@
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    shell.appendChild(footer());
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
