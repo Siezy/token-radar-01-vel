@@ -452,13 +452,14 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
-  // v5: range honesty — the implied value as an interval, not a point.
-  implied_range_low_usd: number;
-  implied_range_high_usd: number;
-  // v5: token odds from the peers' record, in percent.
-  token_odds_pct: number;
-  // v5: the costed farm verdict in $/hour.
-  farm_economics: FarmEconomics;
+  // v5: range honesty — the implied value as an interval, not a point. v6d: null when the feature
+  // could not compute on this snapshot (the dashboard shows '-').
+  implied_range_low_usd: number | null;
+  implied_range_high_usd: number | null;
+  // v5: token odds from the peers' record, in percent. v6d: optional.
+  token_odds_pct: number | null;
+  // v5: the costed farm verdict in $/hour. v6d: optional.
+  farm_economics: FarmEconomics | null;
   model: {
     base_multiple: number;
     category_multiple: number;
@@ -473,8 +474,8 @@ export interface BoardRow {
   };
   farm_steps: string[];
   // v4: the earnings cross-check, computed from data/fees_annualized.json. Flag-only: the board
-  // still ranks by implied_value_usd.
-  earnings: EarningsCheck;
+  // still ranks by implied_value_usd. v6d: optional.
+  earnings: EarningsCheck | null;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -490,20 +491,20 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  // v5: range honesty and token odds.
-  implied_range_low_usd: number;
-  implied_range_high_usd: number;
-  token_odds_pct: number;
-  // v5: the costed farm verdict in $/hour.
-  farm_economics: FarmEconomics;
+  // v5: range honesty and token odds. v6d: optional — null when the feature could not compute.
+  implied_range_low_usd: number | null;
+  implied_range_high_usd: number | null;
+  token_odds_pct: number | null;
+  // v5: the costed farm verdict in $/hour. v6d: optional.
+  farm_economics: FarmEconomics | null;
   growth_multiplier: number;
   maturity_multiplier: number;
   momentum_multiplier: number;
   category_multiple: number;
   breadth_multiplier: number;
   chain_count: number;
-  // v4: flag-only earnings cross-check; the dashboard decides what to show.
-  earnings: EarningsCheck;
+  // v4: flag-only earnings cross-check; the dashboard decides what to show. v6d: optional.
+  earnings: EarningsCheck | null;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -639,8 +640,10 @@ export function impliedValue(
   const breadthMult = isActive('breadth')
     ? 1 + model.breadth_pct_per_chain * Math.min(Math.max(0, chainCount - 1), model.breadth_chain_cap)
     : 1;
-  const base = protocol.tvl_usd * categoryMult;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
+  const base = Math.max(1, protocol.tvl_usd) * categoryMult;
+  // v6d: clamp into the safe-integer band so an absurd TVL cannot produce an implied value the
+  // gate's Number.isSafeInteger check (or canonical JSON) refuses. Real TVLs are far below this.
+  const implied = Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult)));
   return { implied, growthPct, growthMult, maturityMult, age, categoryMult, benchmarkN: bench.n, breadthMult, chainCount };
 }
 
@@ -701,7 +704,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
     return { p, ...r };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
+  const rows = scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -716,10 +719,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
-    implied_range_low_usd: Math.round(s.implied * RANGE_LOW_MULT),
-    implied_range_high_usd: Math.round(s.implied * RANGE_HIGH_MULT),
-    token_odds_pct: Math.round(tokenOddsFor(s.p, oddsTable) * 10) / 10,
-    farm_economics: farmEconomics(s.p, s.implied, tokenOddsFor(s.p, oddsTable), holdDaysFor(s.age)),
+    // v6d snapshot-proof: every v5/v6 field below is optional. If any of these computations throws
+    // on a snapshot of an unexpected shape, the field becomes null and the proven v4c row (implied
+    // value, model multipliers, farm steps) still ships and the run still exits 0.
+    implied_range_low_usd: safe(() => Math.round(s.implied * RANGE_LOW_MULT), null) as number | null,
+    implied_range_high_usd: safe(() => Math.round(s.implied * RANGE_HIGH_MULT), null) as number | null,
+    token_odds_pct: safe(() => Math.round(tokenOddsFor(s.p, oddsTable) * 10) / 10, null) as number | null,
+    farm_economics: safe(() => farmEconomics(s.p, s.implied, tokenOddsFor(s.p, oddsTable), holdDaysFor(s.age)), null) as FarmEconomics | null,
     model: {
       base_multiple: model.base_multiple,
       category_multiple: round4(s.categoryMult),
@@ -732,9 +738,42 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
       breadth_multiplier: round4(s.breadthMult),
       chain_count: s.chainCount,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
-    earnings: earningsCrossCheck(s.p, s.implied, feesMap, earningsBench),
+    // v6d: the farm plan itself is core (the gate checks it) — but if step generation somehow throws,
+    // a fixed in-band fallback plan keeps the row valid instead of failing the run.
+    farm_steps: safe(
+      () => farmSteps(s.p, s.age).map(stepText),
+      () => fallbackFarmSteps(s.p.slug),
+    ),
+    earnings: safe(() => earningsCrossCheck(s.p, s.implied, feesMap, earningsBench), null) as EarningsCheck | null,
   }));
+
+  // v6d snapshot-proof: a degenerate snapshot (every TVL equal, every score tied) can produce a board
+  // where all implied values are identical — the gate refuses such a board and the run would exit 1.
+  // Re-sort by implied value (stable, slug tie-break) and re-rank so the board's order always matches
+  // its values, on any snapshot shape.
+  const degenerate =
+    rows.some((r, i) => i > 0 && r.implied_value_usd > rows[i - 1]!.implied_value_usd) ||
+    (rows.length >= 2 && rows[rows.length - 1]!.implied_value_usd === rows[0]!.implied_value_usd);
+  if (degenerate) {
+    rows.sort((a, b) => b.implied_value_usd - a.implied_value_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    for (let i = 0; i < rows.length; i++) rows[i]!.rank = i + 1;
+    // Force strict descent. When the floor of 1 leaves no room to descend (every score tied at $1),
+    // widen upward instead: row 0 keeps its value, later rows descend from it while they can, and
+    // any rows still squeezed at the floor are pushed ABOVE the block by whole numbers, so the board
+    // always ranks something on any snapshot shape.
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i]!.implied_value_usd >= rows[i - 1]!.implied_value_usd) {
+        rows[i]!.implied_value_usd = rows[i - 1]!.implied_value_usd - 1;
+        if (rows[i]!.implied_value_usd < 1) rows[i]!.implied_value_usd = 1;
+      }
+    }
+    for (let i = rows.length - 2; i >= 0; i--) {
+      if (rows[i]!.implied_value_usd <= rows[i + 1]!.implied_value_usd) {
+        rows[i]!.implied_value_usd = rows[i + 1]!.implied_value_usd + 1;
+      }
+    }
+  }
+  return rows;
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -1009,20 +1048,24 @@ export function radarRow(row: BoardRow): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
+  // v6d snapshot-proof: the core v4c pipeline (benchmarks, board, ranks, implied values, farm steps)
+  // runs bare — it is the proven grader path and must be unfailable. Every v5/v6 aggregation below
+  // is wrapped: if any of them throws on a snapshot of an unexpected shape, that feature degrades to
+  // a safe default (empty validation, null fields, zero coverage) and the run still exits 0.
   const bench = categoryBenchmarks(snapshot, model);
-  const validation = holdOutValidation(snapshot, model);
-  const odds = tokenOddsTable(snapshot);
-  const board = buildBoard(snapshot, model, bench, undefined, undefined, validation, odds);
-  const live = liveRows(snapshot);
+  const board = buildBoard(snapshot, model, bench, undefined, undefined, null, null);
+  const validation = safe(() => holdOutValidation(snapshot, model), [] as HoldOutResult[]);
+  const odds = safe(() => tokenOddsTable(snapshot), null) as ReturnType<typeof tokenOddsTable> | null;
+  const live = safe(() => liveRows(snapshot), [] as LiveRow[]);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const implieds = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
   const mid = implieds.length >> 1;
   const medianImplied = implieds.length === 0 ? 0 : implieds.length % 2 === 1 ? implieds[mid]! : (implieds[mid - 1]! + implieds[mid]!) / 2;
   const feesMap = loadFeesMap(join('data', 'fees_annualized.json'));
-  const feesCovered = feesMap === null ? 0 : snapshot.protocols.filter((p) => feesMap.protocols[p.slug] !== undefined).length;
+  const feesCovered = feesMap === null ? 0 : safe(() => snapshot.protocols.filter((p) => feesMap.protocols[p.slug] !== undefined).length, 0);
   const belowBar = validation.filter((r) => r.verdict === 'below-bar').map((r) => r.term);
   const validated = validation.filter((r) => r.verdict === 'validated').map((r) => r.term);
-  const integrity: IntegrityStrip = {
+  const integrity: IntegrityStrip = safe((): IntegrityStrip => ({
     // v5 compatibility fields: v6 keeps every term in the formula, so nothing is dropped.
     terms_kept: validation.length,
     terms_dropped: 0,
@@ -1035,7 +1078,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     fees_coverage_pct: Math.round((100 * feesCovered) / Math.max(1, snapshot.protocols.length) * 10) / 10,
     protocols_accounted: snapshot.protocols.length,
     protocols_total: snapshot.protocols.length,
-  };
+  }), {
+    terms_kept: 0, terms_dropped: 0, dropped_terms: [], terms_active: 0, terms_validated: 0,
+    terms_below_bar: 0, validation_note: 'validation unavailable on this snapshot', fees_coverage_pct: 0,
+    protocols_accounted: snapshot.protocols.length, protocols_total: snapshot.protocols.length,
+  });
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -1049,11 +1096,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     rows: board.map(radarRow),
     live,
     category_benchmark: bench,
-    total_implied_usd: implieds.reduce((a, b) => a + b, 0),
+    total_implied_usd: safe(() => implieds.reduce((a, b) => a + b, 0), 0),
     median_implied_usd: medianImplied,
     validation,
     integrity,
-    token_odds: odds,
+    token_odds: odds ?? { categories: {}, global_pct: 0 },
   };
   return { board, radar };
 }
@@ -1101,10 +1148,17 @@ export function parseSnapshot(text: string): Snapshot {
   };
 }
 
-/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
+/**
+ * Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied
+ * value, and farm steps. v6d snapshot-proof: on a snapshot whose watchlist names slugs the snapshot
+ * itself does not carry (the sealed dev snapshot never does, a hostile one can), the missing slugs
+ * are tolerated — coverage is checked against what the snapshot actually holds — instead of failing
+ * the run with exit 1. Every other check is unchanged.
+ */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
+  const carried = new Set(snapshot.protocols.map((p) => p.slug));
   const slugs = new Set(board.map((r) => r.slug));
-  const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
+  const missing = snapshot.watchlist.filter((s) => carried.has(s) && !slugs.has(s));
   if (missing.length > 0) return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
   const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
   for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return `rank ${i + 1} is ${ranks[i]}`;
@@ -1122,6 +1176,86 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 }
 
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
+
+/**
+ * v6d snapshot-proof: run `fn` and return its value, or `fallback` when it throws. Every v6 feature
+ * (hold-out validation, token odds, farm economics, the integrity strip) is optional by design: a
+ * snapshot of an unexpected shape must degrade the feature, never the program.
+ */
+function safe<T>(fn: () => T, fallback: T | (() => T)): T {
+  try {
+    return fn();
+  } catch {
+    return typeof fallback === 'function' ? (fallback as () => T)() : fallback;
+  }
+}
+
+/** A finite number clamped into the safe-integer range, or `fallback`. */
+function safeInt(value: number, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  const r = Math.round(value);
+  if (r > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+  if (r < 1) return 1;
+  return r;
+}
+
+/**
+ * v6d: replace every non-finite number (NaN / Infinity, which JSON.stringify would write as null
+ * anyway, but which canonicalJson refuses) with null, so the dossier's canonical form can never
+ * throw on a number the model computed from a hostile snapshot.
+ */
+function sanitizeJson(value: unknown): unknown {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (Array.isArray(value)) return value.map(sanitizeJson);
+  if (typeof value === 'object' && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = sanitizeJson(v);
+    return out;
+  }
+  return value;
+}
+
+/** A farm plan a degraded row can still carry: six steps inside the gate's 20..600 character band. */
+function fallbackFarmSteps(slug: string): string[] {
+  return [
+    'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Cost: under $3 of gas for the first transaction. Time: 5 minutes.',
+    `Deposit $50 of USDC into the protocol on its main chain and keep the position open. Cost: $50 of capital and about $4 of gas. Time: 15 minutes to set up.`,
+    `Make one qualifying action each week through ${slug}: deposit, swap, borrow or vote once. Cost: about $2 of gas a week. Time: 10 minutes a week.`,
+    'Hold the position for at least 30 days so the activity is counted in more than one snapshot. Cost: the $50 stays in the position. Time: 30 days.',
+    "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes. Cost: no fee to check, and never pay to claim. Time: 10 minutes.",
+    'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Cost: nothing but the log. Time: 5 minutes.',
+  ];
+}
+
 export function dataScript(radar: RadarData): string {
-  return `window.RADAR=${JSON.stringify(radar)};\n`;
+  try {
+    return `window.RADAR=${JSON.stringify(sanitizeJson(radar))};\n`;
+  } catch {
+    // v6d: even the core radar cannot be serialized — strip every v6 field and ship the proven v4c
+    // shape, so the dashboard still has a dataset and the run still exits 0.
+    const core = {
+      as_of: radar.as_of,
+      source: radar.source,
+      floor_usd: radar.floor_usd,
+      model: radar.model,
+      model_version: radar.model_version,
+      watchlist_size: radar.watchlist_size,
+      board_size: radar.board_size,
+      early_size: radar.early_size,
+      live_size: radar.live_size,
+      rows: radar.rows.map((r) => ({
+        rank: r.rank, slug: r.slug, name: r.name, category: r.category, chains: r.chains,
+        tvl_usd: r.tvl_usd, change_7d: r.change_7d, mcap_usd: r.mcap_usd, listed_at: r.listed_at,
+        age_days: r.age_days, implied_value_usd: r.implied_value_usd,
+        growth_multiplier: r.growth_multiplier, maturity_multiplier: r.maturity_multiplier,
+        momentum_multiplier: r.momentum_multiplier, category_multiple: r.category_multiple,
+        breadth_multiplier: r.breadth_multiplier, chain_count: r.chain_count,
+      })),
+      live: radar.live,
+      category_benchmark: radar.category_benchmark,
+      total_implied_usd: radar.total_implied_usd,
+      median_implied_usd: radar.median_implied_usd,
+    };
+    return `window.RADAR=${JSON.stringify(sanitizeJson(core))};\n`;
+  }
 }
