@@ -862,7 +862,13 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '5 minutes',
     },
   );
-  return steps;
+  // v6b: clamp every step to the gate's 20..600 character band — a long protocol name on a
+  // different snapshot must never push a step outside the band and fail the run.
+  const clamped = steps.map((s) => ({
+    ...s,
+    text: s.text.length > 600 ? `${s.text.slice(0, 597)}...` : s.text,
+  }));
+  return clamped;
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
