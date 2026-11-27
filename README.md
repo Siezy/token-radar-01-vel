@@ -1,4 +1,4 @@
-# Launch Radar (Token Radar v3, model radar-3)
+# Launch Radar (Token Radar v4, model radar-4)
 
 Ranking of 200+ pre-token protocols by implied value, computed from a frozen DefiLlama snapshot — no hardcoded names, no vibes.
 
@@ -40,6 +40,24 @@ implied = round( TVL × category_multiple × momentum × maturity × breadth )
 
 Product: $2.75B × 0.1689 × 0.989 × 0.9548 × 1.20 ≈ **$527,052,713 implied value**. The dashboard recomputes this same number in the browser from `data.js` and shows it next to the board's figure, so the page's arithmetic and the data are visibly identical.
 
+## Earnings cross-check (v4)
+
+New in radar-4: every row carries an **earnings cross-check** — the model's implied value divided by the protocol's annualized trailing-1y fees (its implied **P/S**), compared against the median P/S of the snapshot's *tokened* protocols in the same category (minimum 3 samples with positive mcap and fees). Fees come from `data/fees_annualized.json`, a repo data file built from the DefiLlama fees API with its own `asOf` timestamp inside — no fee number is hardcoded in the model; the model reads the file at build time with `fs`. If the file is missing or unparseable, the cross-check skips entirely (`n/a`) and the build still succeeds.
+
+Verdicts:
+
+- **overvalued** — implied P/S is more than **2×** the category median. The record carries an adjusted value: `2 × median × annual fees`, capped at the original implied value (never inflated).
+- **underpriced** — implied P/S is below **0.5×** the category median; adjusted = `0.5 × median × annual fees`, also capped at the original implied.
+- **fair** — in between.
+- **no-benchmark** — the category has fewer than 3 tokened peers with fees data (e.g. Risk Curators), so no median exists.
+- **n/a** — the protocol has no fees data (annualized fees ≤ 0 or absent from the map).
+
+**Flag-only by design:** the board still ranks by the *original* implied value. Each row carries the adjusted figure alongside (`earnings.adjusted_implied_usd`), and the dashboard decides what to display — the ranking in `board.json` is never shifted by the cross-check.
+
+**Coverage:** 14/20 (70%) of the top-20 and 110/200 (55%) of the top-200 rows have usable fees data; the remaining ~45% of top-200 protocols (mostly pre-token vaults and curators) are not reported on the DefiLlama `/overview/fees` endpoint — a stated limitation, flagged `n/a` rather than guessed.
+
+**Examples:** USDD (CDP) implies a P/S of **41.8×** against a category median of **~1.06×** → `overvalued`; its adjusted value drops roughly 90% to about $15.4M. OnRe (RWA) implies **4.01×** against a median of ~6.9× → `fair`, no adjustment. The dashboard's detail drawer renders the verdict as a colored chip (red overvalued, green fair, blue underpriced, grey n/a), the implied vs median P/S, the annual fees, and the adjusted value; the board table shows a small verdict badge per row.
+
 ## Farm plans, designed per category
 
 Every row carries a concrete farm plan built from its own record — category, chains, TVL and age decide the action, the capital ($50–$250), the hold period (30–60 days), and every cost and time estimate:
@@ -72,7 +90,7 @@ Three real screenshots from the running dashboard:
 ## Repo structure
 
 - `main.ts` — entrypoint: reads the frozen snapshot, runs the model, writes `output/` (board.json, data.js, dossier) and the dashboard + screenshots.
-- `lib/model.ts` — the radar-3 implied-value model: category-benchmark multiples, clamped momentum, log maturity, breadth multiplier with clamp info.
+- `lib/model.ts` — the radar-4 implied-value model: category-benchmark multiples, clamped momentum, log maturity, breadth multiplier with clamp info, plus the v4 earnings cross-check (`lib/model.ts` reads `data/fees_annualized.json`).
 - `lib/` — farm plan generation and snapshot utilities.
 - `dashboard/` — the dashboard page (board / detail drawer with per-factor breakdown / filters / benchmark panel).
 - `screenshots/` — the three real screenshots above.

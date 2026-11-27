@@ -1,3 +1,16 @@
+// v4 (radar-4): earnings cross-check — implied P/S vs the category's median tokened P/S, from data/fees_annualized.json.
+//
+// v4 changes over v3:
+//   earningsCrossCheck(protocol, implied) reads the annualized-1y fees map (data/fees_annualized.json,
+//                a repo data file with its own asOf timestamp — never hardcoded numbers) and the
+//                category median P/S (median mcap/fees of tokened protocols, >= 3 samples):
+//                implied P/S > 2x median -> 'overvalued'   (adjusted = 2x median x fees, capped at implied)
+//                implied P/S < 0.5x median -> 'underpriced' (adjusted = 0.5x median x fees, capped at implied)
+//                else 'fair'; a category without a median -> 'no-benchmark'; no fees data -> 'n/a'.
+//   The board keeps ranking by the ORIGINAL implied value (flag-only): each row carries `earnings`
+//                with the adjusted figure alongside, and the dashboard chooses what to show.
+//   Defensive: a missing or unparseable data file skips the cross-check entirely ('n/a'), no error.
+//
 // v3 (radar-3): category-benchmark implied value + breadth premium + clamped multiples.
 //
 // v3 changes over v2:
@@ -29,6 +42,9 @@
 //
 // The benchmark table (category -> multiple and sample count) travels in RadarData so the dashboard can
 // show it. No protocol name is ever special-cased: the same function scores every row.
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -111,7 +127,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -125,6 +141,38 @@ export interface FarmStep {
   cost: string;
   time: string;
 }
+
+/**
+ * v4: the earnings cross-check's record for one row. `verdict` is 'overvalued' | 'underpriced' |
+ * 'fair' | 'no-benchmark' | 'n/a'. The numeric fields are null whenever the verdict cannot compute
+ * them (no fees data, no category median, or the protocol itself tokened).
+ */
+export interface EarningsCheck {
+  verdict: 'overvalued' | 'underpriced' | 'fair' | 'no-benchmark' | 'n/a';
+  implied_ps: number | null;
+  category_median_ps: number | null;
+  annual_fees_usd: number | null;
+  adjusted_implied_usd: number | null;
+}
+
+/** The shape of data/fees_annualized.json: a snapshot date and slug -> annualized trailing-1y fees. */
+export interface FeesFile {
+  as_of: string;
+  source: string;
+  protocols: Record<string, { id?: string; name?: string; annualized1y: number }>;
+}
+
+/** The category median P/S samples that met the minimum, plus the medians themselves. */
+export interface EarningsBenchmarks {
+  medians: Record<string, number>;
+}
+
+/** Minimum tokened protocols per category before a P/S median counts as a benchmark. */
+export const EARNINGS_MIN_SAMPLES = 3;
+/** A protocol is overvalued when its implied P/S exceeds twice the category median. */
+export const EARNINGS_OVER_MULT = 2;
+/** A protocol is underpriced when its implied P/S is below half the category median. */
+export const EARNINGS_UNDER_MULT = 0.5;
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -155,6 +203,9 @@ export interface BoardRow {
     chain_count: number;
   };
   farm_steps: string[];
+  // v4: the earnings cross-check, computed from data/fees_annualized.json. Flag-only: the board
+  // still ranks by implied_value_usd.
+  earnings: EarningsCheck;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -176,6 +227,8 @@ export interface RadarRow {
   category_multiple: number;
   breadth_multiplier: number;
   chain_count: number;
+  // v4: flag-only earnings cross-check; the dashboard decides what to show.
+  earnings: EarningsCheck;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -330,8 +383,10 @@ export interface BoardSummary {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, benchmarks?: BenchmarkTable): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, benchmarks?: BenchmarkTable, fees?: FeesFile | null, earnings?: EarningsBenchmarks | null): BoardRow[] {
   const bench = benchmarks ?? categoryBenchmarks(snapshot, model);
+  const feesMap = fees === undefined ? loadFeesMap(join('data', 'fees_annualized.json')) : fees;
+  const earningsBench = earnings === undefined ? earningsBenchmarks(snapshot, feesMap) : earnings;
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -381,6 +436,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
       chain_count: s.chainCount,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    earnings: earningsCrossCheck(s.p, s.implied, feesMap, earningsBench),
   }));
 }
 
@@ -529,6 +585,97 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/**
+ * v4: the annualized trailing-1y fees map out of data/fees_annualized.json, or null when the file is
+ * missing or unparseable — the cross-check then skips entirely ('n/a') instead of failing the build.
+ */
+export function loadFeesMap(path: string = join('data', 'fees_annualized.json')): FeesFile | null {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    const raw = JSON.parse(text) as Record<string, unknown>;
+    if (typeof raw !== 'object' || raw === null || typeof raw.protocols !== 'object' || raw.protocols === null) return null;
+    const protocols: FeesFile['protocols'] = {};
+    for (const [slug, v] of Object.entries(raw.protocols as Record<string, unknown>)) {
+      if (typeof v !== 'object' || v === null) continue;
+      const o = v as Record<string, unknown>;
+      if (typeof o.annualized1y !== 'number' || !Number.isFinite(o.annualized1y)) continue;
+      protocols[slug] = { annualized1y: o.annualized1y };
+    }
+    return {
+      as_of: typeof raw.as_of === 'string' ? raw.as_of : 'unknown',
+      source: typeof raw.source === 'string' ? raw.source : 'unknown',
+      protocols,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * v4: the category median P/S (median mcap/annualized-fees) of the snapshot's tokened protocols,
+ * per category, over categories with at least EARNINGS_MIN_SAMPLES tokened samples. Only positive
+ * mcaps and fees enter a median. Returns null when no fees map is available.
+ */
+export function earningsBenchmarks(snapshot: Snapshot, fees: FeesFile | null): EarningsBenchmarks | null {
+  if (fees === null) return null;
+  const byCategory = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.category === null) continue;
+    const f = fees.protocols[p.slug];
+    if (f === undefined || f.annualized1y <= 0) continue;
+    const list = byCategory.get(p.category);
+    if (list === undefined) byCategory.set(p.category, [p.mcap_usd / f.annualized1y]);
+    else list.push(p.mcap_usd / f.annualized1y);
+  }
+  const medians: Record<string, number> = {};
+  for (const [category, list] of byCategory) {
+    if (list.length < EARNINGS_MIN_SAMPLES) continue;
+    medians[category] = median(list)!;
+  }
+  return { medians };
+}
+
+/**
+ * v4: the earnings cross-check for one board row. Fees are annualized trailing-1y from the fees map;
+ * implied P/S is the row's implied value divided by those fees. Verdicts:
+ *   'overvalued'   implied P/S > 2x the category median; adjusted = 2x median x fees, capped at implied.
+ *   'underpriced'  implied P/S < 0.5x the category median; adjusted = 0.5x median x fees, capped at implied.
+ *   'fair'         in between (adjusted stays the implied value).
+ *   'no-benchmark' the category has no median (fewer than 3 tokened samples).
+ *   'n/a'          no fees data for the protocol (or no fees map at all): the cross-check skips.
+ */
+export function earningsCrossCheck(
+  protocol: SnapshotProtocol,
+  implied: number,
+  fees: FeesFile | null,
+  benchmarks: EarningsBenchmarks | null,
+): EarningsCheck {
+  const f = fees === null ? undefined : fees.protocols[protocol.slug];
+  const feesUsd = f !== undefined && f.annualized1y > 0 ? f.annualized1y : null;
+  if (feesUsd === null) return { verdict: 'n/a', implied_ps: null, category_median_ps: null, annual_fees_usd: null, adjusted_implied_usd: null };
+  const medianPs = benchmarks !== null && protocol.category !== null && Number.isFinite(benchmarks.medians[protocol.category])
+    ? benchmarks.medians[protocol.category]!
+    : null;
+  const impliedPs = implied / feesUsd;
+  if (medianPs === null) return { verdict: 'no-benchmark', implied_ps: round2(impliedPs), category_median_ps: null, annual_fees_usd: feesUsd, adjusted_implied_usd: null };
+  if (impliedPs > EARNINGS_OVER_MULT * medianPs) {
+    const adjusted = Math.min(implied, Math.round(EARNINGS_OVER_MULT * medianPs * feesUsd));
+    return { verdict: 'overvalued', implied_ps: round2(impliedPs), category_median_ps: round2(medianPs), annual_fees_usd: feesUsd, adjusted_implied_usd: adjusted };
+  }
+  if (impliedPs < EARNINGS_UNDER_MULT * medianPs) {
+    const adjusted = Math.min(implied, Math.round(EARNINGS_UNDER_MULT * medianPs * feesUsd));
+    return { verdict: 'underpriced', implied_ps: round2(impliedPs), category_median_ps: round2(medianPs), annual_fees_usd: feesUsd, adjusted_implied_usd: adjusted };
+  }
+  return { verdict: 'fair', implied_ps: round2(impliedPs), category_median_ps: round2(medianPs), annual_fees_usd: feesUsd, adjusted_implied_usd: implied };
+}
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
 export function radarRow(row: BoardRow): RadarRow {
   return {
@@ -549,6 +696,7 @@ export function radarRow(row: BoardRow): RadarRow {
     category_multiple: row.model.category_multiple,
     breadth_multiplier: row.model.breadth_multiplier,
     chain_count: row.model.chain_count,
+    earnings: row.earnings,
   };
 }
 

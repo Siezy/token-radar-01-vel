@@ -345,7 +345,7 @@
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
-        )),
+        ), earningsBadge(r)),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -483,6 +483,47 @@
     );
   }
 
+  // v4: the earnings cross-check panel — verdict chip, implied P/S vs the category median, the
+  // annual fees behind it, and the fees-scaled adjusted value. Skipped entirely when the row
+  // carries no earnings field (defensive) or the verdict is 'n/a'.
+  function earningsPanel(row) {
+    var e = row.earnings;
+    if (!e || !e.verdict || e.verdict === 'n/a') return null;
+    var label = e.verdict === 'no-benchmark'
+      ? 'no category benchmark'
+      : e.verdict;
+    var chip = el('span', { class: 'chip verdict-' + e.verdict, text: label });
+    var lines = [];
+    if (e.implied_ps !== null && e.implied_ps !== undefined) {
+      lines.push(el('div', null, el('span', { text: 'Implied P/S (value \u00f7 annual fees)' }), el('b', { class: 'num', text: fmtMult(e.implied_ps) })));
+    }
+    if (e.category_median_ps !== null && e.category_median_ps !== undefined) {
+      lines.push(el('div', null, el('span', { text: 'Category median P/S (tokened peers)' }), el('b', { class: 'num', text: fmtMult(e.category_median_ps) })));
+    }
+    if (e.annual_fees_usd !== null && e.annual_fees_usd !== undefined) {
+      lines.push(el('div', null, el('span', { text: 'Annualized fees (trailing 1y)' }), el('b', { class: 'num', text: fmtUsd(e.annual_fees_usd) })));
+    }
+    if (e.adjusted_implied_usd !== null && e.adjusted_implied_usd !== undefined) {
+      lines.push(el('div', null, el('span', { text: 'Fees-scaled adjusted value' }), el('b', { class: 'num', text: fmtUsd(e.adjusted_implied_usd) })));
+    }
+    var note = e.verdict === 'no-benchmark'
+      ? 'This category has fewer than ' + (DATA.model && DATA.model.earnings_min_samples ? DATA.model.earnings_min_samples : 3) + ' tokened peers with fees data, so no P/S median exists. The implied value stands on its own.'
+      : 'Flag-only: the board still ranks by the original implied value. The adjusted value scales it by the category\u2019s earnings benchmark (capped at the original implied), it does not move the ranking.';
+    return el('section', { class: 'detail-section' },
+      el('h3', { text: 'Earnings cross-check' }),
+      chip,
+      el('div', { class: 'equation' }, lines),
+      el('p', { class: 'sub', text: note })
+    );
+  }
+
+  // v4: the board's small verdict badge in the implied-value cell.
+  function earningsBadge(row) {
+    var e = row.earnings;
+    if (!e || !e.verdict || e.verdict === 'n/a') return null;
+    return el('span', { class: 'chip verdict-' + e.verdict, title: 'Earnings cross-check: implied P/S vs the category\u2019s median tokened P/S', text: e.verdict === 'no-benchmark' ? 'no bench' : e.verdict });
+  }
+
   function openDetail(slug) {
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
@@ -513,6 +554,8 @@
     ));
     var benchPanel = benchmarkPanel(row);
     if (benchPanel) dialog.appendChild(benchPanel);
+    var earnPanel = earningsPanel(row);
+    if (earnPanel) dialog.appendChild(earnPanel);
     dialog.appendChild(factorBreakdown(row));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),

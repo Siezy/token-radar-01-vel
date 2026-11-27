@@ -167,6 +167,13 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 }
 .chip-bench { color: var(--surface); background: var(--accent); border-color: var(--accent); }
 
+/* v4: earnings cross-check verdict chips. overvalued red, fair green, underpriced blue, no-benchmark/n/a grey. */
+.verdict-overvalued { color: #f88; border-color: #f88; background: rgba(255, 80, 80, 0.12); }
+.verdict-fair { color: #6d6; border-color: #6d6; background: rgba(80, 220, 80, 0.12); }
+.verdict-underpriced { color: #7ab8ff; border-color: #7ab8ff; background: rgba(90, 160, 255, 0.12); }
+.verdict-no-benchmark { color: inherit; }
+.verdict-n-a { color: inherit; }
+
 th button { white-space: nowrap; }
 .sort-ind { font-size: 10px; color: var(--accent); }
 th[data-active="true"] button { color: var(--ink); font-weight: 600; }
