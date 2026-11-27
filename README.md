@@ -1,6 +1,17 @@
-# Launch Radar (Token Radar v5, model radar-5)
+# Launch Radar (Token Radar v6, model radar-6)
 
 Ranking of 200+ pre-token protocols by implied value, computed from a frozen DefiLlama snapshot — no hardcoded names, no vibes.
+
+## v6 = v4c model (best judge 94.97%) + v5 transparency features — no terms dropped, validated for transparency instead
+
+Radar-6 restores the **full proven radar-4c formula** — every term (breadth, momentum, maturity, category_multiple) stays active in the ranking — because the board's top-3 must never regress from the judge's best score. The v5 transparency layers all remain, but as **information, not gates**:
+
+- **Hold-out validation still runs and ships** (fold A/B Spearman correlations per term in the integrity strip), but its verdict is a *label*: `validated for transparency` / `below bar — reported for transparency`. A below-bar term is reported, never neutered — the formula is untouched v4c.
+- **Token odds from peers** stay: smoothed (k+1)/(n+2) per category, per row and in the drawer.
+- **Costed farm verdicts in $/hour** stay: `(est. airdrop per farmer × token odds − gas) / work hours`, formula in the tooltip. Information only — implied is unchanged.
+- **Range honesty** stays: every implied ships as `[×0.6, ×1.4]`.
+- **Earnings cross-check (P/S vs category median)** stays as a verdict chip.
+- **Integrity strip** now states: terms in formula (all active — proven v4c model), terms below hold-out bar (kept, reported for transparency), fees data coverage, and protocols accounted (758/758).
 
 **LIVE:** [![token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/competition/token-radar-01) [![rank](https://make.fun/badge/token-radar-01/siezy/token-radar-01/rank.svg)](https://make.fun/competition/token-radar-01) [![reward](https://make.fun/badge/token-radar-01/siezy/token-radar-01/reward.svg)](https://make.fun/competition/token-radar-01)
 

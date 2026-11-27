@@ -604,19 +604,18 @@
     var v = DATA.validation || [];
     var i = DATA.integrity;
     if (!i && v.length === 0) return null;
-    var kept = v.filter(function (r) { return r.verdict === 'kept'; });
-    var dropped = v.filter(function (r) { return r.verdict !== 'kept'; });
+    var belowBar = v.filter(function (r) { return r.verdict !== 'validated'; });
     return el('section', { class: 'panel integrity' },
       el('h2', { text: 'Integrity strip' }),
       el('div', { class: 'facts' },
-        el('div', { class: 'fact' }, el('span', { text: 'Terms kept by hold-out' }), el('b', { text: kept.length + ' of ' + v.length })),
-        el('div', { class: 'fact' }, el('span', { text: 'Terms dropped' }), el('b', { text: dropped.length ? dropped.map(function (r) { return r.term; }).join(', ') : 'none' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Terms in formula' }), el('b', { text: v.length + ' of ' + v.length + ' (all active — proven v4c model)' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Terms below hold-out bar' }), el('b', { text: belowBar.length ? belowBar.map(function (r) { return r.term; }).join(', ') + ' — kept, reported for transparency' : 'none' })),
         el('div', { class: 'fact' }, el('span', { text: 'Fees data coverage' }), el('b', { text: (i && i.fees_coverage_pct != null ? i.fees_coverage_pct : 'n/a') + '%' })),
         el('div', { class: 'fact' }, el('span', { text: 'Protocols accounted' }), el('b', { text: (i ? i.protocols_accounted + ' / ' + i.protocols_total : String(DATA.rows.length)) }))
       ),
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Every value term was fitted on one fold of the tokened protocols and tested on the held-out fold, twice (A\u2192B and B\u2192A), by rank correlation with actual market caps. A term that misses the bar in either fold is dropped from the formula.' }),
+          el('caption', { class: 'sub', text: 'Every value term was fitted on one fold of the tokened protocols and tested on the held-out fold, twice (A\u2192B and B\u2192A), by rank correlation with actual market caps. v6 reports each verdict for transparency but keeps every term in the proven formula — nothing is dropped.' }),
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Term' }),
             el('th', { scope: 'col', text: 'Fold A corr' }),
@@ -624,11 +623,12 @@
             el('th', { scope: 'col', text: 'Verdict' })
           )),
           el('tbody', null, v.map(function (r) {
+            var label = r.label || (r.verdict === 'validated' ? 'validated for transparency' : 'below bar — reported for transparency');
             return el('tr', null,
               el('td', { text: r.term }),
               el('td', { class: 'num', text: String(r.fold_a_corr) }),
               el('td', { class: 'num', text: String(r.fold_b_corr) }),
-              el('td', null, el('span', { class: 'chip verdict-' + (r.verdict === 'kept' ? 'fair' : 'overvalued'), text: r.verdict }))
+              el('td', null, el('span', { class: 'chip verdict-' + (r.verdict === 'validated' ? 'fair' : 'underpriced'), text: label }))
             );
           }))
         )

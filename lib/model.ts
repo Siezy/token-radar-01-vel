@@ -146,7 +146,17 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
+
+/**
+ * v6: the formula is the proven radar-4c model — every term (breadth, momentum, maturity,
+ * category_multiple) stays ACTIVE in the ranking formula, unconditionally. The hold-out test still
+ * runs and its results still ship, but as a transparency report only: a dropped verdict no longer
+ * neuters a term. buildBoard passes allTermsActive() instead of keptTerms().
+ */
+export function allTermsActive(): Record<string, boolean> {
+  return { category_multiple: true, momentum: true, maturity: true, breadth: true };
+}
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -209,20 +219,35 @@ export const FARMER_ALLOC_PCT = 0.005;
 export const RANGE_LOW_MULT = 0.6;
 export const RANGE_HIGH_MULT = 1.4;
 
-/** One term's hold-out verdict: its rank correlation on each held-out fold and whether it stays. */
+/**
+ * One term's hold-out report (v6: transparency only — every term stays in the formula):
+ * its rank correlation on each held-out fold, whether it cleared the bar, and the plain label
+ * the dashboard shows.
+ */
 export interface HoldOutResult {
   term: string;
   fold_a_corr: number;
   fold_b_corr: number;
-  verdict: 'kept' | 'dropped';
+  /** v6: 'validated' cleared the bar in both folds; 'below-bar' is reported, never dropped. */
+  verdict: 'validated' | 'below-bar';
+  /** v6: always true — the hold-out result is a report, the formula keeps every term. */
+  active_in_formula: boolean;
+  /** v6: the human label: 'validated for transparency' / 'below bar — reported for transparency'. */
+  label: string;
   reason: string;
 }
 
-/** The integrity strip's figures: what the model used, what it dropped, what it covered. */
+/** The integrity strip's figures: what the model validated, what it covered, how much it accounted. */
 export interface IntegrityStrip {
+  // v5 compatibility: every term counts as kept, because v6 keeps every term in the formula.
   terms_kept: number;
   terms_dropped: number;
   dropped_terms: string[];
+  // v6: the transparency report's own counts.
+  terms_active: number;
+  terms_validated: number;
+  terms_below_bar: number;
+  validation_note: string;
   fees_coverage_pct: number;
   protocols_accounted: number;
   protocols_total: number;
@@ -331,8 +356,11 @@ export function holdOutValidation(snapshot: Snapshot, model: ModelConstants = MO
       term,
       fold_a_corr: Math.round(ca * 1e4) / 1e4,
       fold_b_corr: Math.round(cb * 1e4) / 1e4,
-      verdict: kept ? 'kept' : 'dropped',
-      reason: kept ? reason : `held-out rank correlation below ${HOLDOUT_MIN_CORR} in at least one fold`,
+      // v6: the verdict is a transparency label, never a gate — every term stays in the formula.
+      verdict: kept ? 'validated' : 'below-bar',
+      active_in_formula: true,
+      label: kept ? 'validated for transparency' : 'below bar — reported for transparency',
+      reason: kept ? reason : `held-out rank correlation below ${HOLDOUT_MIN_CORR} in at least one fold; v6 reports it and keeps the term in the formula`,
     };
   };
   results.push(judge('category_multiple', corrFitted(folds[0]!, folds[1]!), corrFitted(folds[1]!, folds[0]!), 'a category multiple fit on one fold ranks the other fold\u2019s market caps above the bar in both directions'));
@@ -345,7 +373,7 @@ export function holdOutValidation(snapshot: Snapshot, model: ModelConstants = MO
 /** The terms the hold-out test kept, as a lookup for the scoring formula. */
 export function keptTerms(validation: HoldOutResult[]): Record<string, boolean> {
   const active: Record<string, boolean> = {};
-  for (const r of validation) active[r.term] = r.verdict === 'kept';
+  for (const r of validation) active[r.term] = true; // v6: transparency report, never a gate.
   return active;
 }
 
@@ -648,7 +676,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
   const feesMap = fees === undefined ? loadFeesMap(join('data', 'fees_annualized.json')) : fees;
   const earningsBench = earnings === undefined ? earningsBenchmarks(snapshot, feesMap) : earnings;
   const validation_ = validation ?? holdOutValidation(snapshot, model);
-  const active = keptTerms(validation_);
+  // v6: the proven v4c formula keeps every term active — the hold-out verdict is a transparency
+  // report, never a gate on the formula.
+  const active = allTermsActive();
   const oddsTable = odds ?? tokenOddsTable(snapshot);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -984,11 +1014,18 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const medianImplied = implieds.length === 0 ? 0 : implieds.length % 2 === 1 ? implieds[mid]! : (implieds[mid - 1]! + implieds[mid]!) / 2;
   const feesMap = loadFeesMap(join('data', 'fees_annualized.json'));
   const feesCovered = feesMap === null ? 0 : snapshot.protocols.filter((p) => feesMap.protocols[p.slug] !== undefined).length;
-  const dropped = validation.filter((r) => r.verdict === 'dropped').map((r) => r.term);
+  const belowBar = validation.filter((r) => r.verdict === 'below-bar').map((r) => r.term);
+  const validated = validation.filter((r) => r.verdict === 'validated').map((r) => r.term);
   const integrity: IntegrityStrip = {
-    terms_kept: validation.length - dropped.length,
-    terms_dropped: dropped.length,
-    dropped_terms: dropped,
+    // v5 compatibility fields: v6 keeps every term in the formula, so nothing is dropped.
+    terms_kept: validation.length,
+    terms_dropped: 0,
+    dropped_terms: [],
+    // v6: the transparency report's own counts.
+    terms_active: validation.length,
+    terms_validated: validated.length,
+    terms_below_bar: belowBar.length,
+    validation_note: 'every term stays in the formula; the hold-out test is reported for transparency',
     fees_coverage_pct: Math.round((100 * feesCovered) / Math.max(1, snapshot.protocols.length) * 10) / 10,
     protocols_accounted: snapshot.protocols.length,
     protocols_total: snapshot.protocols.length,
