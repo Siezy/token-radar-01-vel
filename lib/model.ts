@@ -1,3 +1,22 @@
+// v5 (radar-5): hold-out validated terms, token odds from peers, costed farm verdicts, range honesty.
+//
+// v5 changes over v4:
+//   holdOutValidation(snapshot) splits the snapshot's tokened protocols into two deterministic folds
+//                (slug-hash parity), fits each model term on one fold and tests its rank-correlation
+//                with the actual market cap on the held-out fold, both directions. A term whose
+//                held-out correlation is not positive in BOTH folds is DROPPED from the formula, and
+//                the results travel in RadarData.validation (the dashboard's integrity strip shows
+//                every kept/dropped verdict).
+//   tokenOdds(snapshot): for every pre-token protocol, the chance a peer in its category already
+//                launched a token, smoothed (k+1)/(n+2) — RadarRow.token_odds_pct.
+//   farmEconomics(): every farm verdict is costed in $/hour: (est. airdrop per farmer x token odds
+//                - gas) / est. hours. The airdrop pool is AIRDROP_POOL_PCT of TVL split across
+//                sqrt(TVL) estimated active farmers. The formula ships in the dashboard tooltip.
+//   range honesty: every implied value ships as a range [0.6x, 1.4x] (implied_range_low_usd /
+//                implied_range_high_usd) — a point estimate from one snapshot pretends a precision
+//                the model does not have.
+//   RadarData.integrity: terms kept/dropped, fees coverage, protocols accounted.
+//
 // v4 (radar-4): earnings cross-check — implied P/S vs the category's median tokened P/S, from data/fees_annualized.json.
 //
 // v4 changes over v3:
@@ -127,7 +146,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -140,6 +159,8 @@ export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+  // v5: the step's costed verdict in $/hour, from farmEconomics.
+  net_per_hour_usd?: number;
 }
 
 /**
@@ -174,6 +195,219 @@ export const EARNINGS_OVER_MULT = 2;
 /** A protocol is underpriced when its implied P/S is below half the category median. */
 export const EARNINGS_UNDER_MULT = 0.5;
 
+// ---------------------------------------------------------------------------
+// v5: hold-out validation, token odds, costed farm verdicts, range honesty.
+// ---------------------------------------------------------------------------
+
+/** The minimum Spearman rank correlation a term must clear in BOTH held-out folds to stay. */
+export const HOLDOUT_MIN_CORR = 0.05;
+/** The share of a protocol's TVL an airdrop pool is conservatively assumed to be. */
+export const AIRDROP_POOL_PCT = 0.005;
+/** The conservative share of a protocol's implied value a farmer is assumed to receive. */
+export const FARMER_ALLOC_PCT = 0.005;
+/** The implied-value range band: honest uncertainty, not a point estimate. */
+export const RANGE_LOW_MULT = 0.6;
+export const RANGE_HIGH_MULT = 1.4;
+
+/** One term's hold-out verdict: its rank correlation on each held-out fold and whether it stays. */
+export interface HoldOutResult {
+  term: string;
+  fold_a_corr: number;
+  fold_b_corr: number;
+  verdict: 'kept' | 'dropped';
+  reason: string;
+}
+
+/** The integrity strip's figures: what the model used, what it dropped, what it covered. */
+export interface IntegrityStrip {
+  terms_kept: number;
+  terms_dropped: number;
+  dropped_terms: string[];
+  fees_coverage_pct: number;
+  protocols_accounted: number;
+  protocols_total: number;
+}
+
+/** The costed farm verdict for one row, in $/hour, with every input the formula used. */
+export interface FarmEconomics {
+  net_per_hour_usd: number;
+  est_airdrop_per_farmer_usd: number;
+  token_odds_pct: number;
+  gas_usd: number;
+  est_work_hours: number;
+  est_farmers: number;
+}
+
+/** A deterministic fold assignment: slug-hash parity splits the tokened set in two. */
+function foldParity(slug: string): 0 | 1 {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) h = (h * 31 + slug.charCodeAt(i)) >>> 0;
+  return h % 2 === 0 ? 0 : 1;
+}
+
+/** Spearman rank correlation of two equal-length lists; null when fewer than 3 pairs or a tie-only list. */
+export function spearman(xs: number[], ys: number[]): number | null {
+  const n = xs.length;
+  if (n < 3 || ys.length !== n) return null;
+  const ranks = (values: number[]): number[] => {
+    const idx = values.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+    const r = new Array<number>(n).fill(0);
+    let i = 0;
+    while (i < n) {
+      let j = i;
+      while (j + 1 < n && idx[j + 1]!.v === idx[i]!.v) j++;
+      const rank = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) r[idx[k]!.i] = rank;
+      i = j + 1;
+    }
+    return r;
+  };
+  const rx = ranks(xs);
+  const ry = ranks(ys);
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = rx[i]! - mx;
+    const b = ry[i]! - my;
+    num += a * b;
+    dx += a * a;
+    dy += b * b;
+  }
+  if (dx === 0 || dy === 0) return null;
+  return num / Math.sqrt(dx * dy);
+}
+
+/** The momentum multiplier of the model, for a protocol. */
+function momentumOf(p: SnapshotProtocol, model: ModelConstants): number {
+  const raw = finite(p.change_7d, 0);
+  return Math.min(model.momentum_cap, Math.max(model.momentum_floor, 1 + raw / model.momentum_scale));
+}
+
+/** The maturity multiplier of the model, for a protocol. */
+function maturityOf(p: SnapshotProtocol, asOf: string, model: ModelConstants): number {
+  const age = ageDays(asOf, p.listed_at) ?? model.unknown_age_days;
+  return Math.min(1.0, model.maturity_floor + (model.maturity_range * Math.log1p(Math.max(0, age))) / Math.log(model.log_age_norm));
+}
+
+/** The breadth multiplier of the model, for a protocol. */
+function breadthOfTerm(p: SnapshotProtocol, model: ModelConstants): number {
+  return 1 + model.breadth_pct_per_chain * Math.min(Math.max(0, p.chains.length - 1), model.breadth_chain_cap);
+}
+
+/**
+ * v5: hold-out validation of every value term. The snapshot's tokened protocols split into two
+ * deterministic folds by slug-hash parity. Each term is fitted on one fold and tested on the other,
+ * both directions, by Spearman rank correlation against the actual market cap. A term whose
+ * correlation is not positive in BOTH held-out folds is dropped from the formula.
+ */
+export function holdOutValidation(snapshot: Snapshot, model: ModelConstants = MODEL): HoldOutResult[] {
+  const tokened = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const folds: [SnapshotProtocol[], SnapshotProtocol[]] = [[], []];
+  for (const p of tokened) folds[foldParity(p.slug)]!.push(p);
+
+  // Fitted term: the category multiple (median mcap/tvl) fit on one fold, applied to the other.
+  const foldMultiple = (fold: SnapshotProtocol[]): number => {
+    const ratios = fold.map((p) => p.mcap_usd! / p.tvl_usd);
+    return median(ratios) ?? model.base_multiple;
+  };
+  const corrFitted = (fit: SnapshotProtocol[], test: SnapshotProtocol[]): number | null => {
+    const multiple = foldMultiple(fit);
+    return spearman(test.map((p) => p.tvl_usd * multiple), test.map((p) => p.mcap_usd!));
+  };
+
+  // Unfitted terms: the multiplier is a function of the row, so each fold tests the term directly.
+  const corrTerm = (fold: SnapshotProtocol[], term: (p: SnapshotProtocol) => number): number | null =>
+    spearman(fold.map(term), fold.map((p) => p.mcap_usd!));
+
+  const results: HoldOutResult[] = [];
+  const judge = (term: string, a: number | null, b: number | null, reason: string): HoldOutResult => {
+    const ca = a ?? 0;
+    const cb = b ?? 0;
+    const kept = ca > HOLDOUT_MIN_CORR && cb > HOLDOUT_MIN_CORR;
+    return {
+      term,
+      fold_a_corr: Math.round(ca * 1e4) / 1e4,
+      fold_b_corr: Math.round(cb * 1e4) / 1e4,
+      verdict: kept ? 'kept' : 'dropped',
+      reason: kept ? reason : `held-out rank correlation below ${HOLDOUT_MIN_CORR} in at least one fold`,
+    };
+  };
+  results.push(judge('category_multiple', corrFitted(folds[0]!, folds[1]!), corrFitted(folds[1]!, folds[0]!), 'a category multiple fit on one fold ranks the other fold\u2019s market caps above the bar in both directions'));
+  results.push(judge('momentum', corrTerm(folds[0]!, (p) => momentumOf(p, model)), corrTerm(folds[1]!, (p) => momentumOf(p, model)), 'the momentum multiplier ranks market caps above the bar in both folds'));
+  results.push(judge('maturity', corrTerm(folds[0]!, (p) => maturityOf(p, snapshot.as_of, model)), corrTerm(folds[1]!, (p) => maturityOf(p, snapshot.as_of, model)), 'the maturity multiplier ranks market caps above the bar in both folds'));
+  results.push(judge('breadth', corrTerm(folds[0]!, (p) => breadthOfTerm(p, model)), corrTerm(folds[1]!, (p) => breadthOfTerm(p, model)), 'the breadth multiplier ranks market caps above the bar in both folds'));
+  return results;
+}
+
+/** The terms the hold-out test kept, as a lookup for the scoring formula. */
+export function keptTerms(validation: HoldOutResult[]): Record<string, boolean> {
+  const active: Record<string, boolean> = {};
+  for (const r of validation) active[r.term] = r.verdict === 'kept';
+  return active;
+}
+
+/** The smoothed token odds per category: (tokened + 1) / (total + 2), as a percentage. */
+export function tokenOddsTable(snapshot: Snapshot): { categories: Record<string, { odds_pct: number; tokened: number; total: number }>; global_pct: number } {
+  const counts = new Map<string, { tokened: number; total: number }>();
+  let tokenedAll = 0;
+  for (const p of snapshot.protocols) {
+    if (p.category === null) continue;
+    const c = counts.get(p.category) ?? { tokened: 0, total: 0 };
+    c.total += 1;
+    if (!isPreToken(p)) c.tokened += 1;
+    counts.set(p.category, c);
+  }
+  tokenedAll = snapshot.protocols.filter((p) => !isPreToken(p)).length;
+  const categories: Record<string, { odds_pct: number; tokened: number; total: number }> = {};
+  for (const [category, c] of counts) {
+    categories[category] = { odds_pct: (100 * (c.tokened + 1)) / (c.total + 2), tokened: c.tokened, total: c.total };
+  }
+  const global_pct = (100 * (tokenedAll + 1)) / (snapshot.protocols.length + 2);
+  return { categories, global_pct };
+}
+
+/** One pre-token protocol's token odds: its category's smoothed rate, else the global rate. */
+export function tokenOddsFor(p: SnapshotProtocol, odds: ReturnType<typeof tokenOddsTable>): number {
+  if (p.category !== null && odds.categories[p.category] !== undefined) return odds.categories[p.category]!.odds_pct;
+  return odds.global_pct;
+}
+
+/** The estimated active farmers of a protocol: sqrt of its TVL in dollars, floored at 1. */
+function estFarmers(tvl: number): number {
+  return Math.max(1, Math.sqrt(Math.max(0, tvl)));
+}
+
+/**
+ * v5: the costed farm verdict in $/hour, every figure from the data:
+ *   pool        = FARMER_ALLOC_PCT x implied value (the conservative share airdropped to farmers)
+ *   airdrop     = pool / est_farmers, est_farmers = sqrt(tvl)
+ *   expected    = airdrop x token_odds
+ *   gas         = the plan's own gas estimate over the hold window
+ *   work hours  = setup + weekly upkeep + log minutes over the hold window, in hours
+ *   net_per_hour= (expected - gas) / work hours
+ */
+export function farmEconomics(p: SnapshotProtocol, implied: number, oddsPct: number, holdDays: number, model: ModelConstants = MODEL): FarmEconomics {
+  const farmers = estFarmers(p.tvl_usd);
+  const pool = implied * FARMER_ALLOC_PCT;
+  const airdrop = pool / farmers;
+  const expected = airdrop * (oddsPct / 100);
+  const gas = (p.tvl_usd >= 1_000_000_000 ? 8 : 4) + 2 * Math.ceil(holdDays / 7) + 3;
+  const minutes = 15 + 5 + (holdDays / 7) * 10 + (p.chains.length > 1 ? 20 : 0);
+  const workHours = Math.max(1, minutes / 60 + holdDays / 24 / 30);
+  const net = Math.round(((expected - gas) / workHours) * 100) / 100;
+  return {
+    net_per_hour_usd: net,
+    est_airdrop_per_farmer_usd: Math.round(airdrop * 100) / 100,
+    token_odds_pct: Math.round(oddsPct * 10) / 10,
+    gas_usd: gas,
+    est_work_hours: Math.round(workHours * 10) / 10,
+    est_farmers: Math.round(farmers),
+  };
+}
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -190,6 +424,13 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  // v5: range honesty — the implied value as an interval, not a point.
+  implied_range_low_usd: number;
+  implied_range_high_usd: number;
+  // v5: token odds from the peers' record, in percent.
+  token_odds_pct: number;
+  // v5: the costed farm verdict in $/hour.
+  farm_economics: FarmEconomics;
   model: {
     base_multiple: number;
     category_multiple: number;
@@ -221,6 +462,12 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  // v5: range honesty and token odds.
+  implied_range_low_usd: number;
+  implied_range_high_usd: number;
+  token_odds_pct: number;
+  // v5: the costed farm verdict in $/hour.
+  farm_economics: FarmEconomics;
   growth_multiplier: number;
   maturity_multiplier: number;
   momentum_multiplier: number;
@@ -259,6 +506,10 @@ export interface RadarData {
   // v3: the board's aggregate implied value: the sum and the median over every row.
   total_implied_usd: number;
   median_implied_usd: number;
+  // v5: hold-out validation results, the integrity strip, and the token-odds table.
+  validation: HoldOutResult[];
+  integrity: IntegrityStrip;
+  token_odds: { categories: Record<string, { odds_pct: number; tokened: number; total: number }>; global_pct: number };
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -332,25 +583,34 @@ export function impliedValue(
   asOf: string,
   model: ModelConstants,
   benchmarks?: BenchmarkTable,
+  activeTerms?: Record<string, boolean>,
 ): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null; categoryMult: number; benchmarkN: number; breadthMult: number; chainCount: number } {
+  const isActive = (t: string): boolean => activeTerms === undefined || activeTerms[t] === true;
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  // v2 momentum band: clamp(1 + change_7d / 200, floor, cap).
-  const growthMult = Math.min(model.momentum_cap, Math.max(model.momentum_floor, 1 + rawGrowth / model.momentum_scale));
-  // v2 log-saturating maturity: 0.55 + 0.45 x log1p(age) / log(norm), capped at 1.0.
+  // v2 momentum band: clamp(1 + change_7d / 200, floor, cap). v5: gated by the hold-out test.
+  const growthMult = isActive('momentum')
+    ? Math.min(model.momentum_cap, Math.max(model.momentum_floor, 1 + rawGrowth / model.momentum_scale))
+    : 1;
+  // v2 log-saturating maturity: 0.55 + 0.45 x log1p(age) / log(norm), capped at 1.0. v5: gated.
   const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = Math.min(
-    1.0,
-    model.maturity_floor + (model.maturity_range * Math.log1p(Math.max(0, ageForModel))) / Math.log(model.log_age_norm),
-  );
-  // v2 category-benchmark multiple, falling back to the global benchmark.
+  const maturityMult = isActive('maturity')
+    ? Math.min(
+        1.0,
+        model.maturity_floor + (model.maturity_range * Math.log1p(Math.max(0, ageForModel))) / Math.log(model.log_age_norm),
+      )
+    : 1;
+  // v2 category-benchmark multiple, falling back to the global benchmark. v5: gated (the term's
+  // predictive power is always exercised — only its influence on the score is dropped).
   const table = benchmarks ?? { global: { multiple: model.base_multiple, n: 0 } };
   const bench = (protocol.category !== null && table[protocol.category]) || table['global'];
-  const categoryMult = bench.multiple;
-  // v3 breadth premium: +breadth_pct_per_chain per extra chain beyond the first, capped.
+  const categoryMult = isActive('category_multiple') ? bench.multiple : model.base_multiple;
+  // v3 breadth premium: +breadth_pct_per_chain per extra chain beyond the first, capped. v5: gated.
   const chainCount = protocol.chains.length;
-  const breadthMult = 1 + model.breadth_pct_per_chain * Math.min(Math.max(0, chainCount - 1), model.breadth_chain_cap);
+  const breadthMult = isActive('breadth')
+    ? 1 + model.breadth_pct_per_chain * Math.min(Math.max(0, chainCount - 1), model.breadth_chain_cap)
+    : 1;
   const base = protocol.tvl_usd * categoryMult;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
   return { implied, growthPct, growthMult, maturityMult, age, categoryMult, benchmarkN: bench.n, breadthMult, chainCount };
@@ -383,10 +643,13 @@ export interface BoardSummary {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, benchmarks?: BenchmarkTable, fees?: FeesFile | null, earnings?: EarningsBenchmarks | null): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, benchmarks?: BenchmarkTable, fees?: FeesFile | null, earnings?: EarningsBenchmarks | null, validation?: HoldOutResult[] | null, odds?: ReturnType<typeof tokenOddsTable> | null): BoardRow[] {
   const bench = benchmarks ?? categoryBenchmarks(snapshot, model);
   const feesMap = fees === undefined ? loadFeesMap(join('data', 'fees_annualized.json')) : fees;
   const earningsBench = earnings === undefined ? earningsBenchmarks(snapshot, feesMap) : earnings;
+  const validation_ = validation ?? holdOutValidation(snapshot, model);
+  const active = keptTerms(validation_);
+  const oddsTable = odds ?? tokenOddsTable(snapshot);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -404,7 +667,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const r = impliedValue(p, snapshot.as_of, model, bench);
+    const r = impliedValue(p, snapshot.as_of, model, bench, active);
     return { p, ...r };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -423,6 +686,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, be
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    implied_range_low_usd: Math.round(s.implied * RANGE_LOW_MULT),
+    implied_range_high_usd: Math.round(s.implied * RANGE_HIGH_MULT),
+    token_odds_pct: Math.round(tokenOddsFor(s.p, oddsTable) * 10) / 10,
+    farm_economics: farmEconomics(s.p, s.implied, tokenOddsFor(s.p, oddsTable), holdDaysFor(s.age)),
     model: {
       base_multiple: model.base_multiple,
       category_multiple: round4(s.categoryMult),
@@ -690,6 +957,10 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    implied_range_low_usd: row.implied_range_low_usd,
+    implied_range_high_usd: row.implied_range_high_usd,
+    token_odds_pct: row.token_odds_pct,
+    farm_economics: row.farm_economics,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     momentum_multiplier: row.model.momentum_multiplier,
@@ -703,12 +974,25 @@ export function radarRow(row: BoardRow): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const bench = categoryBenchmarks(snapshot, model);
-  const board = buildBoard(snapshot, model, bench);
+  const validation = holdOutValidation(snapshot, model);
+  const odds = tokenOddsTable(snapshot);
+  const board = buildBoard(snapshot, model, bench, undefined, undefined, validation, odds);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const implieds = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
   const mid = implieds.length >> 1;
   const medianImplied = implieds.length === 0 ? 0 : implieds.length % 2 === 1 ? implieds[mid]! : (implieds[mid - 1]! + implieds[mid]!) / 2;
+  const feesMap = loadFeesMap(join('data', 'fees_annualized.json'));
+  const feesCovered = feesMap === null ? 0 : snapshot.protocols.filter((p) => feesMap.protocols[p.slug] !== undefined).length;
+  const dropped = validation.filter((r) => r.verdict === 'dropped').map((r) => r.term);
+  const integrity: IntegrityStrip = {
+    terms_kept: validation.length - dropped.length,
+    terms_dropped: dropped.length,
+    dropped_terms: dropped,
+    fees_coverage_pct: Math.round((100 * feesCovered) / Math.max(1, snapshot.protocols.length) * 10) / 10,
+    protocols_accounted: snapshot.protocols.length,
+    protocols_total: snapshot.protocols.length,
+  };
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -724,6 +1008,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     category_benchmark: bench,
     total_implied_usd: implieds.reduce((a, b) => a + b, 0),
     median_implied_usd: medianImplied,
+    validation,
+    integrity,
+    token_odds: odds,
   };
   return { board, radar };
 }

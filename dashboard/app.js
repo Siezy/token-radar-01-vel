@@ -550,8 +550,28 @@
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+      typeof row.implied_range_low_usd === 'number'
+        ? el('p', { class: 'sub' }, el('b', { text: 'Range honesty: ' }), el('span', { text: 'a point estimate from one snapshot pretends a precision the model does not have. The honest interval for this row is ' + fmtUsd(row.implied_range_low_usd) + ' \u2013 ' + fmtUsd(row.implied_range_high_usd) + ' (0.6\u00d7\u20131.4\u00d7 the implied value).' }))
+        : null,
+      typeof row.token_odds_pct === 'number'
+        ? el('p', { class: 'sub' }, el('b', { text: 'Token odds: ' }), el('span', { text: row.token_odds_pct.toFixed(1) + '% \u2014 the share of this protocol\u2019s category peers that already launched a token, smoothed (k+1)/(n+2). Odds come from the peers\u2019 record, not a guess.' }))
+        : null
     ));
+    var econ = row.farm_economics;
+    if (econ && typeof econ.net_per_hour_usd === 'number') {
+      dialog.appendChild(el('section', { class: 'detail-section' },
+        el('h3', { text: 'Costed farm verdict' }),
+        el('div', { class: 'equation' },
+          el('div', null, el('span', { text: 'Net per hour' }), el('b', { class: 'num', text: (econ.net_per_hour_usd < 0 ? '\u2212$' : '$') + Math.abs(econ.net_per_hour_usd).toFixed(2) })),
+          el('div', null, el('span', { text: 'Est. airdrop per farmer' }), el('b', { class: 'num', text: fmtUsd(econ.est_airdrop_per_farmer_usd) })),
+          el('div', null, el('span', { text: 'Token odds' }), el('b', { class: 'num', text: econ.token_odds_pct.toFixed(1) + '%' })),
+          el('div', null, el('span', { text: 'Gas over the hold' }), el('b', { class: 'num', text: fmtUsd(econ.gas_usd) })),
+          el('div', null, el('span', { text: 'Est. active farmers' }), el('b', { class: 'num', text: String(econ.est_farmers) }))
+        ),
+        el('p', { class: 'sub', text: 'net/hour = (airdrop\u00d7odds \u2212 gas) \u00f7 hours, where airdrop = 0.5% of the implied value \u00f7 \u221atvl (the estimated active farmers). Every figure is from the data; a negative net means the plan does not pay its own gas at these odds.' })
+      ));
+    }
     var benchPanel = benchmarkPanel(row);
     if (benchPanel) dialog.appendChild(benchPanel);
     var earnPanel = earningsPanel(row);
@@ -579,11 +599,50 @@
     );
   }
 
+  // v5: the integrity strip at the top of the page — what the model validated, dropped and covered.
+  function integrityStrip() {
+    var v = DATA.validation || [];
+    var i = DATA.integrity;
+    if (!i && v.length === 0) return null;
+    var kept = v.filter(function (r) { return r.verdict === 'kept'; });
+    var dropped = v.filter(function (r) { return r.verdict !== 'kept'; });
+    return el('section', { class: 'panel integrity' },
+      el('h2', { text: 'Integrity strip' }),
+      el('div', { class: 'facts' },
+        el('div', { class: 'fact' }, el('span', { text: 'Terms kept by hold-out' }), el('b', { text: kept.length + ' of ' + v.length })),
+        el('div', { class: 'fact' }, el('span', { text: 'Terms dropped' }), el('b', { text: dropped.length ? dropped.map(function (r) { return r.term; }).join(', ') : 'none' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Fees data coverage' }), el('b', { text: (i && i.fees_coverage_pct != null ? i.fees_coverage_pct : 'n/a') + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Protocols accounted' }), el('b', { text: (i ? i.protocols_accounted + ' / ' + i.protocols_total : String(DATA.rows.length)) }))
+      ),
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('caption', { class: 'sub', text: 'Every value term was fitted on one fold of the tokened protocols and tested on the held-out fold, twice (A\u2192B and B\u2192A), by rank correlation with actual market caps. A term that misses the bar in either fold is dropped from the formula.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Term' }),
+            el('th', { scope: 'col', text: 'Fold A corr' }),
+            el('th', { scope: 'col', text: 'Fold B corr' }),
+            el('th', { scope: 'col', text: 'Verdict' })
+          )),
+          el('tbody', null, v.map(function (r) {
+            return el('tr', null,
+              el('td', { text: r.term }),
+              el('td', { class: 'num', text: String(r.fold_a_corr) }),
+              el('td', { class: 'num', text: String(r.fold_b_corr) }),
+              el('td', null, el('span', { class: 'chip verdict-' + (r.verdict === 'kept' ? 'fair' : 'overvalued'), text: r.verdict }))
+            );
+          }))
+        )
+      )
+    );
+  }
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    var strip = integrityStrip();
+    if (strip) shell.appendChild(strip);
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelPanel());
